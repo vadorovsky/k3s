@@ -5,6 +5,7 @@ go 1.16
 replace (
 	github.com/Microsoft/hcsshim => github.com/Microsoft/hcsshim v0.8.20
 	github.com/benmoss/go-powershell => github.com/k3s-io/go-powershell v0.0.0-20201118222746-51f4c451fbd7
+	github.com/cloudnativelabs/kube-router => github.com/k3s-io/kube-router dual-stack
 	github.com/containerd/aufs => github.com/containerd/aufs v1.0.0
 	github.com/containerd/btrfs => github.com/containerd/btrfs v1.0.0
 	github.com/containerd/cgroups => github.com/containerd/cgroups v1.0.1
