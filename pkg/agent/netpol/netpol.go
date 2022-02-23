@@ -8,6 +8,7 @@ package netpol
 
 import (
 	"context"
+	"net"
 	"strings"
 	"sync"
 
@@ -15,12 +16,33 @@ import (
 	"github.com/cloudnativelabs/kube-router/pkg/healthcheck"
 	"github.com/cloudnativelabs/kube-router/pkg/options"
 	"github.com/cloudnativelabs/kube-router/pkg/utils"
+	"github.com/coreos/go-iptables/iptables"
 	"github.com/k3s-io/k3s/pkg/daemons/config"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	v1core "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 )
+
+// JoinNets joins a slice of IPNet to a comma-separated string.
+func JoinNets(elems []*net.IPNet, sep string) string {
+	switch len(elems) {
+	case 0:
+		return ""
+	case 1:
+		return elems[0].String()
+	}
+
+	var b strings.Builder
+	b.WriteString(elems[0].String())
+	for _, e := range elems[1:] {
+		b.WriteString(sep)
+		b.WriteString(e.String())
+	}
+	return b.String()
+}
 
 // Run creates and starts a new instance of the kube-router network policy controller
 // The code in this function is cribbed from the upstream controller at:
@@ -50,7 +72,9 @@ func Run(ctx context.Context, nodeConfig *config.Node) error {
 	}
 
 	krConfig := options.NewKubeRouterConfig()
-	krConfig.ClusterIPCIDR = nodeConfig.AgentConfig.ServiceCIDR.String()
+	krConfig.ClusterIPCIDR = JoinNets(nodeConfig.AgentConfig.ServiceCIDRs, ",")
+	krConfig.EnableIPv4 = true
+	krConfig.EnableIPv6 = nodeConfig.AgentConfig.EnableIPv6
 	krConfig.NodePortRange = strings.ReplaceAll(nodeConfig.AgentConfig.ServiceNodePortRange.String(), "-", ":")
 	krConfig.HostnameOverride = nodeConfig.AgentConfig.NodeName
 	krConfig.MetricsEnabled = false
@@ -71,6 +95,35 @@ func Run(ctx context.Context, nodeConfig *config.Node) error {
 	informerFactory.Start(stopCh)
 	informerFactory.WaitForCacheSync(stopCh)
 
+	iptablesCmdHandlers := make(map[v1core.IPFamily]utils.IPTablesHandler, 2)
+	ipSetHandlers := make(map[v1core.IPFamily]utils.IPSetHandler, 2)
+
+	iptHandler, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	if err != nil {
+		return errors.Wrap(err, "failed to create iptables handler")
+	}
+	iptablesCmdHandlers[v1core.IPv4Protocol] = iptHandler
+
+	ipset, err := utils.NewIPSet(false)
+	if err != nil {
+		return errors.Wrap(err, "failed to create ipset handler")
+	}
+	ipSetHandlers[v1core.IPv4Protocol] = ipset
+
+	if nodeConfig.AgentConfig.EnableIPv6 {
+		ipt6Handler, err := iptables.NewWithProtocol(iptables.ProtocolIPv6)
+		if err != nil {
+			return errors.Wrap(err, "failed to create iptables handler")
+		}
+		iptablesCmdHandlers[v1core.IPv6Protocol] = ipt6Handler
+
+		ipset, err := utils.NewIPSet(true)
+		if err != nil {
+			return errors.Wrap(err, "failed to create ipset handler")
+		}
+		ipSetHandlers[v1core.IPv6Protocol] = ipset
+	}
+
 	// Start kube-router healthcheck server. Netpol requires it
 	hc, err := healthcheck.NewHealthController(krConfig)
 	if err != nil {
@@ -83,7 +136,8 @@ func Run(ctx context.Context, nodeConfig *config.Node) error {
 	wg.Add(1)
 	go hc.RunCheck(healthCh, stopCh, &wg)
 
-	npc, err := netpol.NewNetworkPolicyController(client, krConfig, podInformer, npInformer, nsInformer, &sync.Mutex{})
+	npc, err := netpol.NewNetworkPolicyController(client, krConfig, podInformer, npInformer, nsInformer, &sync.Mutex{},
+		iptablesCmdHandlers, ipSetHandlers)
 	if err != nil {
 		return err
 	}
